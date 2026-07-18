@@ -1,6 +1,6 @@
-from typing import TypedDict, Annotated, Sequence
+from typing import TypedDict, Annotated, Sequence, Union
 import operator
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
@@ -43,10 +43,11 @@ def search_papers(query: str) -> str:
     return "\n\n".join(output)
 
 @tool
-def index_paper(arxiv_id: str) -> str:
+def index_paper(arxiv_id: Union[str, float, int]) -> str:
     """
     Download and index a specific ArXiv paper by its ID.
     """
+    arxiv_id = str(arxiv_id).strip()
     if is_paper_indexed(arxiv_id):
         return f"Paper {arxiv_id} is already indexed. You can ask questions about its content now!"
         
@@ -91,10 +92,11 @@ def index_paper(arxiv_id: str) -> str:
         return f"Failed to download or index paper {arxiv_id}."
 
 @tool
-def ask_about_paper(arxiv_id: str, question: str) -> str:
+def ask_about_paper(arxiv_id: Union[str, float, int], question: str) -> str:
     """
     Query the content of an indexed paper to answer a question.
     """
+    arxiv_id = str(arxiv_id).strip()
     if not is_paper_indexed(arxiv_id):
         return f"Paper {arxiv_id} is not indexed yet. Please call the 'index_paper' tool on it first."
         
@@ -146,10 +148,35 @@ Available tools:
 - search_papers: to search for papers on ArXiv.
 - index_paper: to download and index a specific paper.
 - ask_about_paper: to ask questions about the contents of an indexed paper.
+
+Crucial Guidelines:
+1. If the user asks a question about a paper's content, you must query its content using the `ask_about_paper` tool.
+2. If `ask_about_paper` returns that the paper is not indexed, you must call the `index_paper` tool to download and index it first.
+3. Once `index_paper` returns success, you must call the `ask_about_paper` tool to query the paper's contents and retrieve the text before handing off to the reasoner.
 """
     messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(state["messages"])
-    response = router_with_tools.invoke(messages)
-    return {"messages": [response]}
+    
+    print("\n================ [DEBUG] ROUTER NODE START ================")
+    print("Node: router")
+    print("Model: qwen/qwen3.6-27b")
+    print(f"Number of messages in history: {len(state['messages'])}")
+    for idx, msg in enumerate(messages):
+        print(f"Message {idx}: Type={type(msg).__name__} | Content: {repr(msg.content[:120])}")
+    print("===========================================================\n")
+    
+    try:
+        response = router_with_tools.invoke(messages)
+        print("\n================ [DEBUG] ROUTER NODE SUCCESS ================")
+        print(f"Response Content: {repr(response.content[:200])}")
+        print(f"Tool Calls: {getattr(response, 'tool_calls', [])}")
+        print("=============================================================\n")
+        return {"messages": [response]}
+    except Exception as e:
+        print("\n❌❌❌ [DEBUG] ROUTER NODE FAILED! ❌❌❌")
+        print(f"Model: qwen/qwen3.6-27b")
+        print(f"Exception: {e}")
+        print("=========================================================\n")
+        raise e
 
 # 2. Router Routing Edge
 def should_continue(state: AgentState):
@@ -159,7 +186,6 @@ def should_continue(state: AgentState):
         return "tools"
     return "reasoner"
 
-# 3. Reasoner Node: Uses Llama 70b (or user-selected reasoning model) to synthesize response
 def call_reasoner(state: AgentState, config: RunnableConfig):
     # Extract config parameters from execution context
     configurable = config.get("configurable", {})
@@ -178,15 +204,53 @@ def call_reasoner(state: AgentState, config: RunnableConfig):
     SYSTEM_PROMPT = """You are Re-Searcher, a powerful AI research assistant. 
 You help users find, summarize, and understand research papers from ArXiv.
 
+You are in synthesis mode. Your sole job is to formulate a clear, helpful response to the user using the search results or paper context already retrieved in the conversation history.
+
 Guidelines:
-- When presenting results from `search_papers`, you MUST list all the papers retrieved (up to 5-10) in a numbered list, showing their Title, Authors, Published Date, ID, PDF link, and a brief 1-2 sentence summary of their abstract. Do not summarize them into a single high-level paragraph; the user needs to see the individual papers to select which one to index.
-- If a user asks about an indexed paper, always use the `ask_about_paper` tool to search for context first.
-- When answering from paper contents (context returned by `ask_about_paper`), mention the relevant page number citations (e.g. Page 3) based on the context.
+- When presenting search results, you MUST list all the papers retrieved in a numbered list, showing their Title, Authors, Published Date, ID, PDF link, and a brief 1-2 sentence summary of their abstract. Do not summarize them into a single high-level paragraph.
+- When answering from paper contents (context returned by the tool), mention the relevant page number citations (e.g. Page 3) based on the context.
 - Keep your tone professional, scientific, and helpful.
+- Do not attempt to invoke any more tool calls. Answer the user directly.
 """
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(state["messages"])
-    response = reasoner_llm.invoke(messages)
-    return {"messages": [response]}
+    
+    # Sanitize message history to remove native tool_calls and ToolMessage structures
+    # so that the API gateway doesn't complain about schema/tool mismatches on non-tool-calling models.
+    sanitized_messages = []
+    for msg in state["messages"]:
+        if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
+            # Strip tool_calls from AIMessage and convert to simple text-based AIMessage
+            calls_desc = ", ".join([f"{tc['name']}({tc['args']})" for tc in msg.tool_calls])
+            sanitized_messages.append(AIMessage(content=f"[Assistant invoked tool(s): {calls_desc}]"))
+        elif isinstance(msg, ToolMessage):
+            # Convert ToolMessage output to a clean SystemMessage
+            sanitized_messages.append(SystemMessage(
+                content=f"[System Info: Tool '{msg.name}' completed execution and returned results:\n{msg.content}]"
+            ))
+        else:
+            sanitized_messages.append(msg)
+            
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + sanitized_messages
+    
+    print("\n================ [DEBUG] REASONER NODE START ================")
+    print("Node: reasoner")
+    print(f"Model: {groq_model}")
+    print(f"Number of messages in history: {len(sanitized_messages)}")
+    for idx, msg in enumerate(messages):
+        print(f"Message {idx}: Type={type(msg).__name__} | Content: {repr(msg.content[:120])}")
+    print("=============================================================\n")
+    
+    try:
+        response = reasoner_llm.invoke(messages)
+        print("\n================ [DEBUG] REASONER NODE SUCCESS ================")
+        print(f"Response Content: {repr(response.content[:200])}")
+        print("===============================================================\n")
+        return {"messages": [response]}
+    except Exception as e:
+        print("\n❌❌❌ [DEBUG] REASONER NODE FAILED! ❌❌❌")
+        print(f"Model: {groq_model}")
+        print(f"Exception: {e}")
+        print("===========================================================\n")
+        raise e
 
 # Build the Graph Workflow
 workflow = StateGraph(AgentState)
@@ -208,8 +272,8 @@ workflow.add_conditional_edges(
     }
 )
 
-# After tools run, we route to the reasoner node
-workflow.add_edge("tools", "reasoner")
+# After tools run, we route back to the router node to allow chaining multiple tool calls
+workflow.add_edge("tools", "router")
 workflow.add_edge("reasoner", END)
 
 # Compile the Graph

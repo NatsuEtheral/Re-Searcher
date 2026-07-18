@@ -1,0 +1,14 @@
+streamlit
+langchain
+langchain-community
+langchain-groq
+langchain-huggingface
+langchain-google-genai
+langgraph
+arxiv
+pypdf
+qdrant-client
+langchain-qdrant
+sentence-transformers
+python-dotenv
+torchvision

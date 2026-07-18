@@ -1,0 +1,6 @@
+.env
+.venv
+.DS_Store
+.qdrant_db
+downloaded_papers
+__pycache__

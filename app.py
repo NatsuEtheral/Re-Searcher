@@ -7,11 +7,13 @@ import importlib
 import config
 import vector_db
 import agent
+import analyzer
 
 # Force reload helper modules during development so changes are picked up on refresh
 importlib.reload(config)
 importlib.reload(vector_db)
 importlib.reload(agent)
+importlib.reload(analyzer)
 
 from agent import agent_graph
 
@@ -113,6 +115,8 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "active_paper_id" not in st.session_state:
     st.session_state.active_paper_id = None
+if "analyzer_report" not in st.session_state:
+    st.session_state.analyzer_report = None
 
 # Helper to clear local database
 def reset_vector_db():
@@ -130,6 +134,7 @@ def reset_vector_db():
         st.session_state.active_paper_id = None
         st.session_state.messages = []
         st.session_state.chat_history = []
+        st.session_state.analyzer_report = None
         st.success("Vector Database and Downloads successfully cleared!")
     except Exception as e:
         st.error(f"Error resetting database: {e}")
@@ -160,7 +165,8 @@ with st.sidebar:
     model_options = [
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
-        "mixtral-8x7b-32768"
+        "mixtral-8x7b-32768",
+        "openai/gpt-oss-120b"
     ]
     groq_model = st.selectbox(
         "Groq Model",
@@ -234,83 +240,212 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Display chat messages
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+tab_chat, tab_analyzer = st.tabs(["💬 Research Chatbot", "📊 Paper Analyzer"])
 
-# Chat Input & Orchestration
-if prompt := st.chat_input("Ask a question, e.g., 'Search for papers on direct preference optimization'"):
-    # Check Groq Key
-    if not groq_key.strip():
-        st.error("Please provide a Groq API Key in the sidebar settings to proceed.")
-        st.stop()
-        
-    # Display user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-        
-    # Append message to LangGraph history
-    st.session_state.chat_history.append(HumanMessage(content=prompt))
-    
-    # Prepare inputs for the Graph
-    inputs = {"messages": st.session_state.chat_history}
-    
-    # If active paper context is set, append system notification to inform the agent
-    if st.session_state.active_paper_id:
-        inputs["messages"] = list(st.session_state.chat_history)
-        inputs["messages"].insert(-1, SystemMessage(
-            content=f"System Context: The user has selected the paper with ArXiv ID '{st.session_state.active_paper_id}' "
-                    f"as the active context. Any questions regarding 'this paper', 'it', or 'the findings' should query this paper "
-                    f"using ask_about_paper."
-        ))
-        
-    # Compile graph execution configuration
-    exec_config = {
-        "configurable": {
-            "groq_api_key": groq_key.strip(),
-            "google_api_key": google_key.strip() if google_key.strip() else None,
-            "embedding_provider": embedding_provider_val,
-            "groq_model": groq_model
-        }
-    }
-    
-    # Display assistant response placeholder
-    with st.chat_message("assistant"):
-        response_text = ""
-        # Create expandable status container for tool execution trace
-        with st.status("🔬 Thinking and orchestrating...", expanded=True) as status:
-            try:
-                for update in agent_graph.stream(inputs, exec_config, stream_mode="updates"):
-                    for node, value in update.items():
-                        if node == "tools":
-                            for msg in value.get("messages", []):
-                                status.write(f"🔧 **Tool `{msg.name}` completed execution.**")
-                                # Provide clean expandable sections for the tool outputs
-                                with st.expander("Show tool details", expanded=False):
-                                    status.code(msg.content[:1000] + ("..." if len(msg.content) > 1000 else ""))
-                        elif node in ("chatbot", "router", "reasoner"):
-                            last_msg = value.get("messages", [])[-1]
-                            if last_msg.content:
-                                response_text = last_msg.content
-                            if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                                for tc in last_msg.tool_calls:
-                                    status.write(f"🤖 **Agent decided to invoke tool**: `{tc['name']}`")
-                
-                status.update(label="Response generated!", state="complete", expanded=False)
-            except Exception as e:
-                status.update(label="Error occurred", state="error", expanded=True)
-                st.error(f"Execution Error: {e}")
-                
-        # Render the final response if generated
-        if response_text:
-            st.markdown(response_text)
-            st.session_state.messages.append({"role": "assistant", "content": response_text})
-            st.session_state.chat_history.append(AIMessage(content=response_text))
+with tab_chat:
+    # Display chat messages
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Chat Input & Orchestration
+    if prompt := st.chat_input("Ask a question, e.g., 'Search for papers on direct preference optimization'"):
+        # Check Groq Key
+        if not groq_key.strip():
+            st.error("Please provide a Groq API Key in the sidebar settings to proceed.")
+            st.stop()
             
-            # Simple UI reload trigger to refresh sidebar indexed list in case a new paper was indexed
-            if "Successfully downloaded and indexed paper" in response_text or "already indexed" in response_text:
-                st.rerun()
+        # Display user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+            
+        # Append message to LangGraph history
+        st.session_state.chat_history.append(HumanMessage(content=prompt))
+        
+        # Prepare inputs for the Graph
+        inputs = {"messages": st.session_state.chat_history}
+        
+        # If active paper context is set, append system notification to inform the agent
+        if st.session_state.active_paper_id:
+            inputs["messages"] = list(st.session_state.chat_history)
+            inputs["messages"].insert(-1, SystemMessage(
+                content=f"System Context: The user has selected the paper with ArXiv ID '{st.session_state.active_paper_id}' "
+                        f"as the active context. Any questions regarding 'this paper', 'it', or 'the findings' should query this paper "
+                        f"using ask_about_paper."
+            ))
+            
+        # Compile graph execution configuration
+        exec_config = {
+            "configurable": {
+                "groq_api_key": groq_key.strip(),
+                "google_api_key": google_key.strip() if google_key.strip() else None,
+                "embedding_provider": embedding_provider_val,
+                "groq_model": groq_model
+            }
+        }
+        
+        # Display assistant response placeholder
+        with st.chat_message("assistant"):
+            response_text = ""
+            # Create expandable status container for tool execution trace
+            with st.status("🔬 Thinking and orchestrating...", expanded=True) as status:
+                try:
+                    for update in agent_graph.stream(inputs, exec_config, stream_mode="updates"):
+                        for node, value in update.items():
+                            if node == "tools":
+                                for msg in value.get("messages", []):
+                                    status.write(f"🔧 **Tool `{msg.name}` completed execution.**")
+                                    # Provide clean expandable sections for the tool outputs
+                                    with st.expander("Show tool details", expanded=False):
+                                        status.code(msg.content[:1000] + ("..." if len(msg.content) > 1000 else ""))
+                            elif node in ("chatbot", "router", "reasoner"):
+                                last_msg = value.get("messages", [])[-1]
+                                if last_msg.content:
+                                    response_text = last_msg.content
+                                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                                    for tc in last_msg.tool_calls:
+                                        status.write(f"🤖 **Agent decided to invoke tool**: `{tc['name']}`")
+                    
+                    status.update(label="Response generated!", state="complete", expanded=False)
+                except Exception as e:
+                    status.update(label="Error occurred", state="error", expanded=True)
+                    st.error(f"Execution Error: {e}")
+                    
+            # Render the final response if generated
+            if response_text:
+                st.markdown(response_text)
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
+                st.session_state.chat_history.append(AIMessage(content=response_text))
+                
+                # Simple UI reload trigger to refresh sidebar indexed list in case a new paper was indexed
+                if "Successfully downloaded and indexed paper" in response_text or "already indexed" in response_text:
+                    st.rerun()
+            else:
+                st.warning("The agent completed run but did not return a final response content.")
+
+with tab_analyzer:
+    st.markdown("### 📊 Research Paper Quality Reviewer")
+    st.markdown(
+        "Upload a draft of your paper in PDF format. The analyzer will extract core keywords from your introduction/abstract, "
+        "search for similar peer-reviewed papers on ArXiv, and perform a detailed conference-style review of your draft."
+    )
+    
+    # Upload Draft PDF
+    uploaded_file = st.file_uploader("Upload Paper PDF Draft (Max 5 pages processed)", type=["pdf"])
+    
+    if uploaded_file:
+        # Check Groq Key
+        if not groq_key.strip():
+            st.error("Please provide a Groq API Key in the sidebar settings to proceed.")
         else:
-            st.warning("The agent completed run but did not return a final response content.")
+            # We can select the evaluation model
+            eval_model = st.selectbox(
+                "Select Reviewer Model",
+                options=["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "openai/gpt-oss-120b"],
+                index=0,
+                key="eval_model_selection",
+                help="llama-3.3-70b is highly recommended for structured academic evaluation."
+            )
+            
+            if st.button("Run Quality Analysis", type="primary"):
+                # Define temporary path in download directory
+                temp_dir = config.DOWNLOAD_DIR
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                temp_pdf_path = temp_dir / "temp_uploaded_draft.pdf"
+                
+                # Save file
+                with open(temp_pdf_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                    
+                # Run evaluation with progress
+                with st.status("🔬 Starting paper review...") as status:
+                    try:
+                        status.write("📄 Processing PDF and extracting text draft...")
+                        import analyzer
+                        
+                        status.write("🔍 Searching ArXiv for related peer baselines...")
+                        report = analyzer.analyze_paper_draft(
+                            pdf_path=str(temp_pdf_path),
+                            groq_api_key=groq_key.strip(),
+                            model_name=eval_model
+                        )
+                        
+                        status.update(label="Analysis complete!", state="complete", expanded=False)
+                        st.session_state.analyzer_report = report
+                    except Exception as e:
+                        status.update(label="Analysis failed!", state="error", expanded=True)
+                        st.error(f"Analysis Error: {e}")
+                        
+            # Display report if available in session state
+            if "analyzer_report" in st.session_state and st.session_state.analyzer_report:
+                report = st.session_state.analyzer_report
+                
+                st.markdown("---")
+                st.markdown(f"## 📋 Review Report: *{report['title']}*")
+                
+                if report.get("abstract"):
+                    with st.expander("📄 Show Extracted Abstract", expanded=False):
+                        st.write(report["abstract"])
+                        
+                if report.get("keywords"):
+                    st.markdown("**Extracted Research Keywords:** " + ", ".join([f"`{kw}`" for kw in report["keywords"]]))
+                    
+                # Display scores in columns
+                st.markdown("### 📊 Rubric Evaluation Scores")
+                c1, c2, c3, c4, c5 = st.columns(5)
+                with c1:
+                    st.metric("Overall Score", f"{report['overall_score']}/100")
+                with c2:
+                    st.metric("Novelty & Contribution", f"{report['novelty_score']}/25")
+                with c3:
+                    st.metric("Methodology Rigor", f"{report['methodology_score']}/25")
+                with c4:
+                    st.metric("Literature Context", f"{report['literature_score']}/25")
+                with c5:
+                    st.metric("Clarity & Quality", f"{report['clarity_score']}/25")
+                    
+                # Feedback tabs
+                st.markdown("---")
+                f_tab1, f_tab2, f_tab3, f_tab4 = st.tabs([
+                    "💡 Strengths & Weaknesses",
+                    "📝 Reviewer Rubric Feedback",
+                    "📚 Related Peer Baselines",
+                    "✅ Actionable Recommendations"
+                ])
+                
+                with f_tab1:
+                    col_str, col_weak = st.columns(2)
+                    with col_str:
+                        st.markdown("### 🟢 Strengths")
+                        for s in report.get("strengths", []):
+                            st.markdown(f"- {s}")
+                    with col_weak:
+                        st.markdown("### 🔴 Weaknesses & Gaps")
+                        for w in report.get("weaknesses", []):
+                            st.markdown(f"- {w}")
+                            
+                with f_tab2:
+                    st.markdown("#### 💡 Novelty & Contribution")
+                    st.write(report.get("novelty_feedback", "N/A"))
+                    st.markdown("#### ⚙️ Methodology Rigor")
+                    st.write(report.get("methodology_feedback", "N/A"))
+                    st.markdown("#### 📚 Literature Context & Citations")
+                    st.write(report.get("literature_feedback", "N/A"))
+                    st.markdown("#### 📝 Clarity & Writing Quality")
+                    st.write(report.get("clarity_feedback", "N/A"))
+                    
+                with f_tab3:
+                    st.markdown("The following baseline papers were retrieved from ArXiv based on your draft's keywords and used for comparative review:")
+                    for paper in report.get("baseline_papers", []):
+                        st.markdown(f"**[{paper['arxiv_id']}] {paper['title']}**")
+                        st.markdown(f"*Authors*: {', '.join(paper['authors'])} | *Published*: {paper['published']}")
+                        st.markdown(f"[PDF Link]({paper['pdf_url']})")
+                        with st.expander("Show abstract", expanded=False):
+                            st.write(paper["summary"])
+                        st.markdown("---")
+                        
+                with f_tab4:
+                    st.markdown("### 🛠️ Actionable Improvement Checklist")
+                    for r in report.get("recommendations", []):
+                        st.markdown(f"- {r}")

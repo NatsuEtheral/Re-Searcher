@@ -1,0 +1,12 @@
+.env
+.venv
+.git
+.gitignore
+.dockerignore
+.qdrant_db
+downloaded_papers
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
